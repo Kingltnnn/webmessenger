@@ -1,0 +1,6 @@
+{
+  "name": "Google Translate",
+  "description": "Google's free service instantly translates words, phrases, and web pages between English and over 100 other languages.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
