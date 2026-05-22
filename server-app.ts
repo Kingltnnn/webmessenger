@@ -3,6 +3,8 @@ import fs from "fs";
 import path from "path";
 import dotenv from "dotenv";
 import { GoogleGenAI } from "@google/genai";
+import { initializeApp, getApps, getApp } from "firebase/app";
+import { getFirestore, doc, getDoc, setDoc, deleteDoc, collection, getDocs, query, orderBy, limit } from "firebase/firestore";
 
 dotenv.config();
 
@@ -101,6 +103,177 @@ function saveDB(store: ChatStore) {
 
 // In-Memory fallback cache in case write fails
 let db: ChatStore = loadDB();
+
+// Initialize Firebase dynamically if keys are present
+let firebaseAppConfig: any = null;
+
+if (process.env.FIREBASE_PROJECT_ID) {
+  firebaseAppConfig = {
+    apiKey: process.env.FIREBASE_API_KEY,
+    authDomain: process.env.FIREBASE_AUTH_DOMAIN,
+    projectId: process.env.FIREBASE_PROJECT_ID,
+    storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
+    messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID,
+    appId: process.env.FIREBASE_APP_ID,
+    measurementId: process.env.FIREBASE_MEASUREMENT_ID,
+    databaseId: process.env.FIREBASE_DATABASE_ID || "(default)"
+  };
+} else {
+  try {
+    const configPath = path.join(process.cwd(), "firebase-applet-config.json");
+    if (fs.existsSync(configPath)) {
+      const configData = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+      firebaseAppConfig = {
+        apiKey: configData.apiKey,
+        authDomain: configData.authDomain,
+        projectId: configData.projectId,
+        storageBucket: configData.storageBucket,
+        messagingSenderId: configData.messagingSenderId,
+        appId: configData.appId,
+        measurementId: configData.measurementId,
+        databaseId: configData.firestoreDatabaseId || "(default)"
+      };
+    }
+  } catch (err) {
+    // Ignore
+  }
+
+  // Fallback to user's explicit provided Firebase coordinates
+  if (!firebaseAppConfig) {
+    firebaseAppConfig = {
+      apiKey: "AIzaSyCo_qwv4j9k6zMmX3m-jEgGUCswf2Gn0IE",
+      authDomain: "translate-9424b.firebaseapp.com",
+      projectId: "translate-9424b",
+      storageBucket: "translate-9424b.firebasestorage.app",
+      messagingSenderId: "1027753787412",
+      appId: "1:1027753787412:web:018ecddec74af569692701",
+      measurementId: "G-5H3NC42T6M",
+      databaseId: "(default)"
+    };
+  }
+}
+
+let dbInstance: any = null;
+if (firebaseAppConfig && firebaseAppConfig.projectId) {
+  try {
+    const fApp = getApps().length === 0 ? initializeApp(firebaseAppConfig) : getApp();
+    dbInstance = getFirestore(fApp, firebaseAppConfig.databaseId);
+    console.log("Firebase Firestore active & connected for chat backend!");
+  } catch (err) {
+    console.error("Failed to initialize Firebase app:", err);
+  }
+}
+
+// Passcode Getter helper
+async function getPasscode(): Promise<string> {
+  if (dbInstance) {
+    try {
+      const docRef = doc(dbInstance, "chat_settings", "global");
+      const docSnap = await getDoc(docRef);
+      if (docSnap.exists()) {
+        const pc = docSnap.data().passcode;
+        if (pc) {
+          db.passcode = pc;
+          saveDB(db);
+          return pc;
+        }
+      } else {
+        await setDoc(docRef, { passcode: db.passcode });
+      }
+    } catch (err) {
+      console.error("Error reading passcode from Firestore (falling back to local memory):", err);
+    }
+  }
+  return db.passcode;
+}
+
+// Passcode Setter helper
+async function setPasscode(newPasscode: string): Promise<boolean> {
+  let savedToFirestore = false;
+  if (dbInstance) {
+    try {
+      const docRef = doc(dbInstance, "chat_settings", "global");
+      await setDoc(docRef, { passcode: newPasscode });
+      savedToFirestore = true;
+    } catch (err) {
+      console.error("Error writing passcode to Firestore (falling back to local memory):", err);
+    }
+  }
+  db.passcode = newPasscode;
+  saveDB(db);
+  return true;
+}
+
+// Get Chats Helper
+async function getChatsFromDB(): Promise<Message[]> {
+  if (dbInstance) {
+    try {
+      const msgsRef = collection(dbInstance, "messages");
+      const q = query(msgsRef, orderBy("timestamp", "asc"), limit(150));
+      const querySnapshot = await getDocs(q);
+      const results: Message[] = [];
+      querySnapshot.forEach((docSnap) => {
+        results.push(docSnap.data() as Message);
+      });
+      
+      // Update local storage so it has the latest synced messages if successful
+      if (results.length > 0) {
+        db.messages = results;
+        saveDB(db);
+      }
+      return results;
+    } catch (err) {
+      console.error("Error reading messages from Firestore, falling back to JSON:", err);
+    }
+  }
+  return db.messages;
+}
+
+// Save Chat Helper
+async function saveMessageToDB(msg: Message): Promise<boolean> {
+  let savedToFirestore = false;
+  if (dbInstance) {
+    try {
+      const docRef = doc(dbInstance, "messages", msg.id);
+      await setDoc(docRef, msg);
+      savedToFirestore = true;
+    } catch (err) {
+      console.error("Error saving message to Firestore (will save to local memory):", err);
+    }
+  }
+  
+  // ALWAYS save to local database as backup/cache!
+  db.messages.push(msg);
+  if (db.messages.length > 150) {
+    db.messages = db.messages.slice(db.messages.length - 150);
+  }
+  saveDB(db);
+  return savedToFirestore;
+}
+
+// Clear Chats Helper
+async function clearAllChatsFromDB(): Promise<boolean> {
+  let clearedFirestore = false;
+  if (dbInstance) {
+    try {
+      const msgsRef = collection(dbInstance, "messages");
+      const querySnapshot = await getDocs(msgsRef);
+      const deletePromises: Promise<void>[] = [];
+      querySnapshot.forEach((docSnap) => {
+        deletePromises.push(deleteDoc(docSnap.ref));
+      });
+      await Promise.all(deletePromises);
+      clearedFirestore = true;
+    } catch (err) {
+      console.error("Error clearing messages from Firestore (will clear local memory):", err);
+    }
+  }
+  
+  // ALWAYS clear local representation as backup!
+  db.messages = [];
+  saveDB(db);
+  return true;
+}
 
 // --- API ENDPOINTS ---
 
@@ -215,50 +388,58 @@ app.post("/api/translate", async (req, res) => {
 });
 
 // Chat Passcode validation
-app.post("/api/chat/verify-passcode", (req, res) => {
+app.post("/api/chat/verify-passcode", async (req, res) => {
   const { passcode } = req.body;
   if (!passcode) {
     res.status(400).json({ error: "Passcode required" });
     return;
   }
 
-  const isValid = passcode === db.passcode;
+  const currentPasscode = await getPasscode();
+  const isValid = passcode === currentPasscode;
   res.json({ success: isValid });
 });
 
 // Change Chat Passcode
-app.post("/api/chat/change-passcode", (req, res) => {
+app.post("/api/chat/change-passcode", async (req, res) => {
   const { oldPasscode, newPasscode } = req.body;
   if (!oldPasscode || !newPasscode) {
     res.status(400).json({ error: "Old and New passcodes are required" });
     return;
   }
 
-  if (oldPasscode !== db.passcode) {
+  const currentPasscode = await getPasscode();
+  if (oldPasscode !== currentPasscode) {
     res.status(403).json({ error: "Incorrect old passcode" });
     return;
   }
 
-  db.passcode = newPasscode;
-  saveDB(db);
-  res.json({ success: true, message: "Passcode changed successfully" });
+  const success = await setPasscode(newPasscode);
+  if (success) {
+    res.json({ success: true, message: "Passcode changed successfully in database" });
+  } else {
+    res.status(500).json({ error: "Failed to update passcode" });
+  }
 });
 
 // Get Secret Chats
-app.get("/api/chat/messages", (req, res) => {
+app.get("/api/chat/messages", async (req, res) => {
   const passcode = req.headers["x-chat-passcode"];
-  if (passcode !== db.passcode) {
+  const currentPasscode = await getPasscode();
+  if (passcode !== currentPasscode) {
     res.status(401).json({ error: "Unauthorized access to chat" });
     return;
   }
 
-  res.json({ messages: db.messages });
+  const messagesList = await getChatsFromDB();
+  res.json({ messages: messagesList });
 });
 
 // Send Secret Chat
 app.post("/api/chat/send", async (req, res) => {
   const passcode = req.headers["x-chat-passcode"];
-  if (passcode !== db.passcode) {
+  const currentPasscode = await getPasscode();
+  if (passcode !== currentPasscode) {
     res.status(401).json({ error: "Unauthorized access to chat" });
     return;
   }
@@ -354,28 +535,25 @@ app.post("/api/chat/send", async (req, res) => {
     }
   }
 
-  db.messages.push(newMessage);
-  
-  // Keep last 150 messages to save space, delete senior chats
-  if (db.messages.length > 150) {
-    db.messages = db.messages.slice(db.messages.length - 150);
-  }
-
-  saveDB(db);
+  await saveMessageToDB(newMessage);
   res.json({ success: true, message: newMessage });
 });
 
 // Clear Secret Chat (Panic Button!)
-app.post("/api/chat/clear", (req, res) => {
+app.post("/api/chat/clear", async (req, res) => {
   const passcode = req.headers["x-chat-passcode"];
-  if (passcode !== db.passcode) {
+  const currentPasscode = await getPasscode();
+  if (passcode !== currentPasscode) {
     res.status(401).json({ error: "Unauthorized access to chat" });
     return;
   }
 
-  db.messages = [];
-  saveDB(db);
-  res.json({ success: true, message: "Chat history cleared instantly" });
+  const success = await clearAllChatsFromDB();
+  if (success) {
+    res.json({ success: true, message: "Chat history cleared instantly" });
+  } else {
+    res.status(500).json({ error: "Failed to clear chat history" });
+  }
 });
 
 export default app;

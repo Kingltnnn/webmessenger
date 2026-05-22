@@ -1,0 +1,59 @@
+{
+  "entities": {
+    "Message": {
+      "title": "Message",
+      "description": "A single secret chat message",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique identifier of the message"
+        },
+        "sender": {
+          "type": "string",
+          "description": "Name of the sender (e.g. An, Nam)"
+        },
+        "text": {
+          "type": "string",
+          "description": "Message text in its original language"
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO timestamp of when the message was sent"
+        },
+        "translation": {
+          "type": "string",
+          "description": "Cloaked or translated version of the message"
+        },
+        "langPair": {
+          "type": "string",
+          "description": "Language direction description (e.g. VI -> EN)"
+        }
+      },
+      "required": ["id", "sender", "text", "timestamp"]
+    },
+    "ChatSettings": {
+      "title": "ChatSettings",
+      "description": "Global chat room settings including passcode",
+      "type": "object",
+      "properties": {
+        "passcode": {
+          "type": "string",
+          "description": "Secret passcode to unlock the chat"
+        }
+      },
+      "required": ["passcode"]
+    }
+  },
+  "firestore": {
+    "/chat_settings/global": {
+      "schema": "ChatSettings",
+      "description": "Global chat configuration containing the current passcode"
+    },
+    "/messages/{messageId}": {
+      "schema": "Message",
+      "description": "Subcollection of chats containing actual messages sent"
+    }
+  }
+}

@@ -1,0 +1,46 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default-deny catch-all rule
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Chat settings rules
+    match /chat_settings/global {
+      allow read: if true; // Allowed to read the configuration to verify passcode
+      allow create, update: if (
+        incoming().passcode is string && 
+        incoming().passcode.size() >= 3 && 
+        incoming().passcode.size() <= 20
+      );
+    }
+
+    // Messages collection rules
+    match /messages/{messageId} {
+      allow read: if true; // Read is enabled so visitors can display the feed
+      allow create: if (
+        isValidId(messageId) &&
+        incoming().sender is string &&
+        incoming().sender.size() <= 50 &&
+        incoming().text is string &&
+        incoming().text.size() <= 5000 &&
+        incoming().timestamp is string
+      );
+      allow delete: if true; // Allow panic clear button
+    }
+  }
+}
