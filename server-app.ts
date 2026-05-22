@@ -255,14 +255,13 @@ if (firebaseAppConfig && firebaseAppConfig.projectId) {
     const fApp = getApps().length === 0 ? initializeApp(firebaseAppConfig) : getApp();
     startupLogs.push("Firebase App initialized successfully.");
     try {
-      // CRITICAL: Try Force HTTP Long Polling instead of standard WebSockets or gRPC streams.
-      // This solves background thread/connection pooling lockups in serverless Vercel Lambda!
+      // Force HTTP Long Polling for stability
       startupLogs.push("Initializing Firestore with force long polling (databaseId: " + firebaseAppConfig.databaseId + ")...");
       dbInstance = initializeFirestore(fApp, {
         experimentalForceLongPolling: true
       }, firebaseAppConfig.databaseId);
-      startupLogs.push("Firebase Firestore active & connected for chat backend (using Long Polling)!");
-      console.log("Firebase Firestore active & connected for chat backend (using Long Polling)!");
+      startupLogs.push("Firebase Firestore active & connected for chat backend (using Client SDK with Long Polling)!");
+      console.log("Firebase Firestore active & connected for chat backend (using Client SDK with Long Polling)!");
     } catch (fsErr: any) {
       startupLogs.push("Could not initialize Firestore with experimentalForceLongPolling, falling back to basic: " + fsErr.message);
       console.warn("Could not initialize Firestore with experimentalForceLongPolling, falling back to basic:", fsErr.message || fsErr);
@@ -284,11 +283,64 @@ if (firebaseAppConfig && firebaseAppConfig.projectId) {
 }
 
 // Passcode Getter helper
+// --- FIRESTORE DIAGNOSTICS & ERROR HANDLING ---
+enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId?: string | null;
+    email?: string | null;
+    emailVerified?: boolean | null;
+    isAnonymous?: boolean | null;
+    tenantId?: string | null;
+    providerInfo?: {
+      providerId?: string | null;
+      email?: string | null;
+    }[];
+  }
+}
+
+function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null): never {
+  const errStr = error instanceof Error ? error.message : String(error);
+  const errInfo: FirestoreErrorInfo = {
+    error: errStr,
+    authInfo: {
+      userId: null,
+      email: null,
+      emailVerified: null,
+      isAnonymous: null,
+      tenantId: null,
+      providerInfo: []
+    },
+    operationType,
+    path
+  };
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
+
 async function getPasscode(): Promise<string> {
   if (dbInstance) {
+    const pathRef = "chat_settings/global";
     try {
       const docRef = doc(dbInstance, "chat_settings", "global");
-      const docSnap = await getDoc(docRef);
+      let docSnap;
+      try {
+        docSnap = await getDoc(docRef);
+      } catch (err) {
+        handleFirestoreError(err, OperationType.GET, pathRef);
+      }
+
       if (docSnap.exists()) {
         const pc = docSnap.data().passcode;
         if (pc) {
@@ -297,10 +349,14 @@ async function getPasscode(): Promise<string> {
           return pc;
         }
       } else {
-        await setDoc(docRef, { passcode: db.passcode });
+        try {
+          await setDoc(docRef, { passcode: db.passcode });
+        } catch (err) {
+          handleFirestoreError(err, OperationType.WRITE, pathRef);
+        }
       }
-    } catch (err) {
-      console.error("Error reading passcode from Firestore (falling back to local memory):", err);
+    } catch (err: any) {
+      console.error("Error reading passcode from Firestore (falling back to local memory):", err.message || err);
     }
   }
   return db.passcode;
@@ -310,12 +366,17 @@ async function getPasscode(): Promise<string> {
 async function setPasscode(newPasscode: string): Promise<boolean> {
   let savedToFirestore = false;
   if (dbInstance) {
+    const pathRef = "chat_settings/global";
     try {
       const docRef = doc(dbInstance, "chat_settings", "global");
-      await setDoc(docRef, { passcode: newPasscode });
-      savedToFirestore = true;
-    } catch (err) {
-      console.error("Error writing passcode to Firestore (falling back to local memory):", err);
+      try {
+        await setDoc(docRef, { passcode: newPasscode });
+        savedToFirestore = true;
+      } catch (err) {
+        handleFirestoreError(err, OperationType.WRITE, pathRef);
+      }
+    } catch (err: any) {
+      console.error("Error writing passcode to Firestore (falling back to local memory):", err.message || err);
     }
   }
   db.passcode = newPasscode;
@@ -326,23 +387,63 @@ async function setPasscode(newPasscode: string): Promise<boolean> {
 // Get Chats Helper
 async function getChatsFromDB(): Promise<Message[]> {
   if (dbInstance) {
+    const pathRef = "messages";
     try {
       const msgsRef = collection(dbInstance, "messages");
       const q = query(msgsRef, orderBy("timestamp", "asc"), limit(150));
-      const querySnapshot = await getDocs(q);
+      let querySnapshot;
+      try {
+        querySnapshot = await getDocs(q);
+      } catch (err) {
+        handleFirestoreError(err, OperationType.LIST, pathRef);
+      }
+
       const results: Message[] = [];
       querySnapshot.forEach((docSnap) => {
-        results.push(docSnap.data() as Message);
+        const data = docSnap.data();
+        if (data && data.id) {
+          results.push(data as Message);
+        }
       });
       
-      // Update local storage so it has the latest synced messages if successful
-      if (results.length > 0) {
-        db.messages = results;
-        saveDB(db);
+      // Merge strategy of Firestore cloud messages and local backup messages:
+      // This protects against data loss when Firestore writes are blocked/denied by rules,
+      // whilst still correctly displaying new local messages in the active feed.
+      const mergedMap = new Map<string, Message>();
+      
+      // 1. Seed with existing local memory data
+      if (db.messages && Array.isArray(db.messages)) {
+        db.messages.forEach(m => {
+          if (m && m.id) {
+            mergedMap.set(m.id, m);
+          }
+        });
       }
-      return results;
-    } catch (err) {
-      console.error("Error reading messages from Firestore, falling back to JSON:", err);
+      
+      // 2. Overwrite or add with Firestore cloud results
+      results.forEach(m => {
+        if (m && m.id) {
+          mergedMap.set(m.id, m);
+        }
+      });
+
+      // 3. Sort chronologically by timestamp
+      const mergedList = Array.from(mergedMap.values()).sort((a, b) => {
+        const timeA = a.timestamp ? new Date(a.timestamp).getTime() : 0;
+        const timeB = b.timestamp ? new Date(b.timestamp).getTime() : 0;
+        return timeA - timeB;
+      });
+
+      // Keep only the most recent 150 messages
+      const finalMessages = mergedList.length > 150 ? mergedList.slice(mergedList.length - 150) : mergedList;
+      
+      // Update local storage representation
+      db.messages = finalMessages;
+      saveDB(db);
+
+      return finalMessages;
+    } catch (err: any) {
+      console.error("Error reading messages from Firestore, falling back to JSON:", err.message || err);
     }
   }
   return db.messages;
@@ -352,12 +453,17 @@ async function getChatsFromDB(): Promise<Message[]> {
 async function saveMessageToDB(msg: Message): Promise<boolean> {
   let savedToFirestore = false;
   if (dbInstance) {
+    const pathRef = `messages/${msg.id}`;
     try {
       const docRef = doc(dbInstance, "messages", msg.id);
-      await setDoc(docRef, msg);
-      savedToFirestore = true;
-    } catch (err) {
-      console.error("Error saving message to Firestore (will save to local memory):", err);
+      try {
+        await setDoc(docRef, msg);
+        savedToFirestore = true;
+      } catch (err) {
+        handleFirestoreError(err, OperationType.WRITE, pathRef);
+      }
+    } catch (err: any) {
+      console.error("Error saving message to Firestore (will save to local memory):", err.message || err);
     }
   }
   
@@ -374,17 +480,29 @@ async function saveMessageToDB(msg: Message): Promise<boolean> {
 async function clearAllChatsFromDB(): Promise<boolean> {
   let clearedFirestore = false;
   if (dbInstance) {
+    const pathRef = "messages";
     try {
       const msgsRef = collection(dbInstance, "messages");
-      const querySnapshot = await getDocs(msgsRef);
-      const deletePromises: Promise<void>[] = [];
+      let querySnapshot;
+      try {
+        querySnapshot = await getDocs(msgsRef);
+      } catch (err) {
+        handleFirestoreError(err, OperationType.LIST, pathRef);
+      }
+
+      const deletePromises: Promise<any>[] = [];
       querySnapshot.forEach((docSnap) => {
-        deletePromises.push(deleteDoc(docSnap.ref));
+        const docPath = `messages/${docSnap.id}`;
+        deletePromises.push(
+          deleteDoc(docSnap.ref).catch((err: any) => {
+            handleFirestoreError(err, OperationType.DELETE, docPath);
+          })
+        );
       });
       await Promise.all(deletePromises);
       clearedFirestore = true;
-    } catch (err) {
-      console.error("Error clearing messages from Firestore (will clear local memory):", err);
+    } catch (err: any) {
+      console.error("Error clearing messages from Firestore (will clear local memory):", err.message || err);
     }
   }
   

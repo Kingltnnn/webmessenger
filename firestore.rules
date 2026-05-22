@@ -8,7 +8,7 @@ service cloud.firestore {
 
     // Helper functions
     function isValidId(id) {
-      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_-]+$');
     }
 
     function incoming() {
@@ -32,12 +32,12 @@ service cloud.firestore {
     // Messages collection rules
     match /messages/{messageId} {
       allow read: if true; // Read is enabled so visitors can display the feed
-      allow create: if (
+      allow create, update: if (
         isValidId(messageId) &&
         incoming().sender is string &&
-        incoming().sender.size() <= 50 &&
+        incoming().sender.size() <= 100 &&
         incoming().text is string &&
-        incoming().text.size() <= 5000 &&
+        incoming().text.size() <= 10000 &&
         incoming().timestamp is string
       );
       allow delete: if true; // Allow panic clear button
